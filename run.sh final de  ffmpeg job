@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "=== Job FFmpeg iniciado ==="
+
+# ===============================
+# 0. VARIABLES DEL JOB
+# ===============================
+: "${IMAGES:?Debes definir IMAGES}"
+: "${AUDIOS:?Debes definir AUDIOS}"
+: "${OUTPUT_BUCKET:?Debes definir OUTPUT_BUCKET}"
+
+OUTPUT_FILENAME="${OUTPUT_FILENAME:-video_$(date +%s).mp4}"
+
+WORKDIR="/tmp/work"
+mkdir -p "$WORKDIR"
+cd "$WORKDIR"
+
+echo "=== Parámetros recibidos ==="
+echo "IMAGES=$IMAGES"
+echo "AUDIOS=$AUDIOS"
+echo "OUTPUT_BUCKET=$OUTPUT_BUCKET"
+echo "OUTPUT_FILENAME=$OUTPUT_FILENAME"
+echo "Directorio: $WORKDIR"
+echo "============================="
+
+# ===============================
+# 1. PARSEAR LISTAS COMA → ARRAY
+# ===============================
+IFS=',' read -ra IMG_ARRAY <<< "$IMAGES"
+IFS=',' read -ra AUD_ARRAY <<< "$AUDIOS"
+
+IMG_COUNT=${#IMG_ARRAY[@]}
+AUD_COUNT=${#AUD_ARRAY[@]}
+
+if [[ "$IMG_COUNT" -ne "$AUD_COUNT" ]]; then
+  echo "Error: cantidad imágenes ($IMG_COUNT) ≠ audios ($AUD_COUNT)"
+  exit 1
+fi
+
+TOTAL=$IMG_COUNT
+echo "Total de pares: $TOTAL"
+
+# ===============================
+# 2. DESCARGAR ARCHIVOS
+# ===============================
+echo "Descargando imágenes y audios..."
+
+for (( i=0; i<TOTAL; i++ )); do
+  IMG_URL="${IMG_ARRAY[$i]}"
+  AUD_URL="${AUD_ARRAY[$i]}"
+
+  echo "Descargando img$i.jpg..."
+  curl -L "$IMG_URL" -o "img$i.jpg"
+
+  echo "Descargando audio$i.mp3..."
+  curl -L "$AUD_URL" -o "audio$i.mp3"
+done
+
+ls -lh
+
+# ===============================
+# 3. GENERAR CLIPS (MOVIMIENTO + FADES)
+# ===============================
+echo "Generando clips…"
+
+for (( i=0; i<TOTAL; i++ )); do
+  echo "Generando clips para escena $i..."
+
+  # Duración exacta del audio
+  DURACION=$(ffprobe -v error -show_entries format=duration -of default=nk=1:nw=1 "audio$i.mp3")
+  DURACION=$(printf "%.3f" "$DURACION")
+
+  # Mitad de la duración
+  MITAD=$(awk -v d="$DURACION" 'BEGIN { printf("%.3f", d/2) }')
+  RESTO=$(awk -v d="$DURACION" -v m="$MITAD" 'BEGIN { printf("%.3f", d-m) }')
+
+  echo "Duración total=$DURACION | Mitad=$MITAD | Resto=$RESTO"
+
+  # Clip A: plano un poco más abierto (primera mitad) + FADE IN
+  ffmpeg -y \
+    -loop 1 -i "img$i.jpg" \
+    -i "audio$i.mp3" \
+    -t "$MITAD" \
+    -filter_complex "[0:v]scale=1200:2133:force_original_aspect_ratio=increase,crop=1080:1920,format=yuv420p,fade=t=in:st=0:d=0.4[v];[1:a]afade=t=in:st=0:d=0.3[a]" \
+    -map "[v]" -map "[a]" \
+    -c:v libx264 -preset medium -tune stillimage \
+    -c:a aac \
+    "clip${i}_a.mp4"
+
+  # Clip B: plano más cerrado (segunda mitad) + FADE OUT
+  ffmpeg -y \
+    -loop 1 -i "img$i.jpg" \
+    -ss "$MITAD" -i "audio$i.mp3" \
+    -t "$RESTO" \
+    -filter_complex "[0:v]scale=1500:2666:force_original_aspect_ratio=increase,crop=1080:1920,format=yuv420p,fade=t=out:st=$(awk -v r="$RESTO" 'BEGIN { printf("%.3f", r-0.4) }'):d=0.4[v];[1:a]afade=t=out:st=$(awk -v r="$RESTO" 'BEGIN { printf("%.3f", r-0.3) }'):d=0.3[a]" \
+    -map "[v]" -map "[a]" \
+    -c:v libx264 -preset medium -tune stillimage \
+    -c:a aac \
+    "clip${i}_b.mp4"
+done
+
+
+# ===============================
+# 4. CONCATENAR TODOS LOS CLIPS
+# ===============================
+echo "Concatenando…"
+
+LIST="list.txt"
+> "$LIST"
+
+for (( i=0; i<TOTAL; i++ )); do
+  echo "file 'clip${i}_a.mp4'" >> "$LIST"
+  echo "file 'clip${i}_b.mp4'" >> "$LIST"
+done
+
+ffmpeg -y -f concat -safe 0 -i "$LIST" -c copy "final.mp4"
+
+echo "Final generado:"
+ls -lh final.mp4
+
+# ===============================
+# 5. SUBIR A GOOGLE CLOUD STORAGE
+# ===============================
+echo "Subiendo a GCS…"
+
+OUTPUT_BUCKET_NORM="${OUTPUT_BUCKET%/}/"
+
+gsutil cp "final.mp4" "${OUTPUT_BUCKET_NORM}${OUTPUT_FILENAME}"
+gsutil acl ch -u AllUsers:R "${OUTPUT_BUCKET_NORM}${OUTPUT_FILENAME}"
+
+
+BUCKET_PATH="${OUTPUT_BUCKET_NORM#gs://}"
+BUCKET_NAME="${BUCKET_PATH%%/*}"
+OBJECT_PREFIX="${BUCKET_PATH#*/}"
+
+[[ "$OBJECT_PREFIX" == "$BUCKET_NAME" ]] && OBJECT_PREFIX=""
+[[ -n "$OBJECT_PREFIX" && "${OBJECT_PREFIX: -1}" != "/" ]] && OBJECT_PREFIX="${OBJECT_PREFIX}/"
+
+PUBLIC_URL="https://storage.googleapis.com/${BUCKET_NAME}/${OBJECT_PREFIX}${OUTPUT_FILENAME}"
+
+echo "VIDEO_URL=$PUBLIC_URL"
+echo "$PUBLIC_URL"
+
+echo "=== Job FFmpeg finalizado correctamente ==="
